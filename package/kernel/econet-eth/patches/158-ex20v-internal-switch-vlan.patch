@@ -1,0 +1,339 @@
+econet-eth: TP-Link EX20v internal-GSW WAN/LAN VLAN split
+
+The EX20v (EN7528) has no external MT7530: its LAN/WAN ports sit on the
+SoC-internal GSW. Program that GSW for a WAN/LAN VLAN split over MMIO, gated
+at runtime on of_machine_is_compatible("tplink,ex20v") so every other econet
+board keeps the dumb-switch path. Includes en75_int_sw_dump() which prints the
+VLAN-table + per-port registers to dmesg for boot-log-based diagnosis.
+
+econet-eth: EX20v -- runtime carrier IPTV hardware bridge (Tivibu/Superonline)
+
+Some Turkish ISPs deliver their IPTV service (TT Tivibu on VLAN 55,
+Superonline on VLAN 103) tagged on the fibre WAN, meant to be handed
+untagged to a set-top box on one LAN socket, invisible to Linux (a pure
+hardware bridge). Previously this required a separate firmware build per
+carrier/port (the VID was hardcoded into en75_int_sw_program() at probe
+time).
+
+Factor the LAN-side VLAN programming into en75_int_sw_apply(lan, vid), safe
+to call again at any time, and expose it as a debugfs file
+(econet_ex20v/iptv -- "echo '<lan 1-3> <vid 55|103>'" enables a socket,
+"echo 0" disables it). Each call re-derives VID 1's LAN membership and both
+known carrier IPTV VLAN table entries from scratch, so switching carrier,
+switching port, or disabling again are all idempotent register rewrites --
+only the one LAN socket being reassigned blips (its link drops and
+re-establishes); WAN, the CPU port and the other two LAN sockets are
+untouched. No reboot or network restart is needed. One firmware image can
+now ship this off, and a LuCI toggle turns it on/off/switches port live.
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -41,6 +41,10 @@
+ #include <linux/iopoll.h>
+ #include <linux/workqueue.h>
+ #include <linux/moduleparam.h>
++#include <linux/debugfs.h>
++#include <linux/string.h>
++#include <linux/kernel.h>
++#include <linux/mutex.h>
+ 
+ #include "gdm_regs.h"
+ #include "econet_ppe.h"
+@@ -52,6 +56,12 @@
+ #include "qdma_regs.h"
+ #include "econet_eth.h"
+ 
++static struct en75_eth_pvt *en75_ex20v_iptv_eth;
++static struct device *en75_ex20v_iptv_dev;
++static int en75_ex20v_iptv_lan, en75_ex20v_iptv_vid;
++static DEFINE_MUTEX(en75_ex20v_iptv_lock);
++static struct dentry *en75_ex20v_iptv_dir;
++
+ /* MT7530 switch configuration */
+ #define  PMCR_FORCE_FDX			BIT(1)
+ #define  PMCR_FORCE_LNK			BIT(0)
+@@ -1109,9 +1119,264 @@ static void en75_remove(struct platform_
+ 		unregister_netdev(eth->ports[i]);
+ 	}
+ 
++	if (en75_ex20v_iptv_dir) {
++		debugfs_remove_recursive(en75_ex20v_iptv_dir);
++		en75_ex20v_iptv_dir = NULL;
++	}
++	en75_ex20v_iptv_eth = NULL;
++	en75_ex20v_iptv_dev = NULL;
++
+ 	platform_set_drvdata(pdev, NULL);
+ }
+ 
++/*
++ * Boards with no external switch (e.g. TP-Link EX20v) carry the physical
++ * LAN/WAN ports on the SoC-internal GSW. Program it for a WAN/LAN VLAN split
++ * directly over MMIO. EX20v switch port map (from PMSR link probing):
++ * LAN1=3, LAN2=2, LAN3=1, WAN=4, CPU=6.
++ */
++static void en75_int_sw_vlan(struct en75_eth_pvt *eth, u16 vid, u32 members,
++			     u32 etag)
++{
++	int i;
++
++	/* VAWD1: IVL_MAC | VTAG_EN | PORT_MEM(members) | FID(1) | VLAN_VALID */
++	en75_gsw_write(eth, 0x94, 0x50000000 | (members << 16) | 0x3);
++	en75_gsw_write(eth, 0x98, etag);
++	/* VTCR: BUSY | FUNC(WR_VID) | vid */
++	en75_gsw_write(eth, 0x90, 0x80001000 | vid);
++	for (i = 0; i < 1000; i++) {
++		if (!(en75_gsw_read(eth, 0x90) & BIT(31)))
++			break;
++		udelay(10);
++	}
++}
++
++/* Indirect read of one VLAN-table entry (VAWD1/VAWD2) for diagnostics. */
++static void en75_int_sw_vlan_read(struct en75_eth_pvt *eth, u16 vid,
++				  u32 *vawd1, u32 *vawd2)
++{
++	int i;
++
++	/* VTCR: BUSY | FUNC(RD_VID=0) | vid */
++	en75_gsw_write(eth, 0x90, 0x80000000 | vid);
++	for (i = 0; i < 1000; i++) {
++		if (!(en75_gsw_read(eth, 0x90) & BIT(31)))
++			break;
++		udelay(10);
++	}
++	*vawd1 = en75_gsw_read(eth, 0x94);
++	*vawd2 = en75_gsw_read(eth, 0x98);
++}
++
++/*
++ * Read the internal GSW programming back so a failing VLAN split is diagnosable
++ * from dmesg alone (no devmem needed). The VLAN-table entries are the prime
++ * suspect: the indirect VTCR write completes synchronously over MMIO and may
++ * race where it could not over an external chip's slow MDIO. A VAWD1 reading
++ * back 0 (instead of 0x504e0003 / 0x50500003) means the table write missed.
++ */
++static void en75_int_sw_dump(struct en75_eth_pvt *eth, struct device *dev)
++{
++	u32 v1, v2;
++	int p;
++
++	dev_info(dev, "int gsw: MFC=%#x PMCR6=%#x\n",
++		 en75_gsw_read(eth, MT753X_MFC),
++		 en75_gsw_read(eth, MT753X_PMCR_P(6)));
++	en75_int_sw_vlan_read(eth, 1, &v1, &v2);
++	dev_info(dev, "int gsw: VID1 VAWD1=%#x VAWD2=%#x\n", v1, v2);
++	en75_int_sw_vlan_read(eth, 2, &v1, &v2);
++	dev_info(dev, "int gsw: VID2 VAWD1=%#x VAWD2=%#x (want 0x50500003 / 0x2000)\n",
++		 v1, v2);
++	en75_int_sw_vlan_read(eth, 35, &v1, &v2);
++	dev_info(dev, "int gsw: VID35 VAWD1=%#x VAWD2=%#x (want 0x50500003 / 0x2200)\n",
++		 v1, v2);
++	en75_int_sw_vlan_read(eth, 55, &v1, &v2);
++	dev_info(dev, "int gsw: VID55 (Tivibu) VAWD1=%#x VAWD2=%#x\n", v1, v2);
++	en75_int_sw_vlan_read(eth, 103, &v1, &v2);
++	dev_info(dev, "int gsw: VID103 (Superonline) VAWD1=%#x VAWD2=%#x\n", v1, v2);
++	for (p = 1; p <= 6; p++) {
++		if (p == 5)
++			continue;
++		dev_info(dev,
++			 "int gsw: port%d PCR=%#x PVID=%#x PVC=%#x PMSR=%#x\n", p,
++			 en75_gsw_read(eth, 0x2004 + p * 0x100),
++			 en75_gsw_read(eth, 0x2014 + p * 0x100),
++			 en75_gsw_read(eth, 0x2010 + p * 0x100),
++			 en75_gsw_read(eth, 0x3008 + p * 0x100));
++	}
++}
++
++/* EX20v customer-facing LAN number (1/2/3) -> internal GSW port index. */
++static const int en75_ex20v_lan_to_gsw[4] = { 0, 3, 2, 1 };
++
++/*
++ * Live-reconfigurable ISP-IPTV hardware bridge (Tivibu VID 55 / Superonline
++ * VID 103 and similar carrier IPTV overlays that arrive tagged on the WAN
++ * fibre and are meant to be handed untagged to a set-top box on one LAN
++ * socket). @lan selects the customer-facing port (1-3), 0 disables the
++ * bridge and returns that port to the plain VID-1 LAN. @vid is the carrier's
++ * IPTV VLAN (ignored when @lan is 0). Safe to call at any time after
++ * en75_int_sw_program(): each call re-derives the full VID-1 membership and
++ * both known IPTV VLAN table entries from scratch, so switching carrier,
++ * switching port, or disabling are all idempotent and glitch only the one
++ * LAN socket being reassigned (its link drops and re-establishes; the other
++ * two LAN sockets, WAN and the CPU port are untouched).
++ */
++static void en75_int_sw_apply(struct en75_eth_pvt *eth, struct device *dev,
++			      int lan, int vid)
++{
++	static const u16 known_iptv_vids[] = { 55, 103 };
++	u32 lan_members, iptv_gsw_bit;
++	int gsw, p, i;
++
++	iptv_gsw_bit = lan ? BIT(en75_ex20v_lan_to_gsw[lan]) : 0;
++
++	/* VID 1 = whichever LAN ports are not the dedicated IPTV port + CPU(6,
++	 * tagged). Members {1,2,3} minus the IPTV port, same VAWD2 as always. */
++	lan_members = (BIT(1) | BIT(2) | BIT(3)) & ~iptv_gsw_bit;
++	en75_int_sw_vlan(eth, 1, lan_members | BIT(6), 0x2000);
++
++	/* Tear down both known carrier IPTV VLANs first: switching carrier or
++	 * port, or disabling, must never leave a stale hardware bridge behind. */
++	for (i = 0; i < ARRAY_SIZE(known_iptv_vids); i++) {
++		en75_gsw_write(eth, 0x94, 0);
++		en75_gsw_write(eth, 0x98, 0);
++		en75_gsw_write(eth, 0x90, 0x80001000 | known_iptv_vids[i]);
++		for (p = 0; p < 1000; p++) {
++			if (!(en75_gsw_read(eth, 0x90) & BIT(31)))
++				break;
++			udelay(10);
++		}
++	}
++
++	if (lan) {
++		/*
++		 * members {IPTV-port, WAN(4)}, VAWD2 0x200: only WAN(4)
++		 * EG_CON=2 (tagged, the ONT expects its own tag back); the LAN
++		 * port EG_CON=0 (untagged to the set-top box). No CPU member:
++		 * this is a pure hardware bridge, Linux never sees the traffic.
++		 */
++		en75_int_sw_vlan(eth, vid, iptv_gsw_bit | BIT(4), 0x200);
++	}
++
++	/* LAN ports 1-3: security mode always; PVID follows the IPTV
++	 * assignment (the dedicated port gets the carrier VID, the rest VID 1).
++	 */
++	for (gsw = 1; gsw <= 3; gsw++) {
++		int pvid = (lan && gsw == en75_ex20v_lan_to_gsw[lan]) ? vid : 1;
++
++		en75_gsw_write(eth, 0x2004 + gsw * 0x100, 0x00ff0003);
++		en75_gsw_write(eth, 0x2014 + gsw * 0x100, pvid);
++		en75_gsw_write(eth, 0x2010 + gsw * 0x100, 0x81000000);
++	}
++
++	dev_info(dev, "ex20v iptv: lan=%d vid=%d applied\n", lan, lan ? vid : 0);
++}
++
++static ssize_t en75_ex20v_iptv_write(struct file *file, const char __user *ubuf,
++				     size_t len, loff_t *off)
++{
++	char buf[32] = {};
++	char *cur, *tok;
++	int lan, vid = 0;
++
++	if (len >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, len))
++		return -EFAULT;
++
++	cur = buf;
++	tok = strsep(&cur, " \t\n");
++	if (!tok || !*tok || kstrtoint(tok, 0, &lan) || lan < 0 || lan > 3)
++		return -EINVAL;
++
++	if (lan != 0) {
++		tok = cur ? strsep(&cur, " \t\n") : NULL;
++		if (!tok || !*tok || kstrtoint(tok, 0, &vid) ||
++		    (vid != 55 && vid != 103))
++			return -EINVAL;
++	}
++
++	mutex_lock(&en75_ex20v_iptv_lock);
++	if (!en75_ex20v_iptv_eth) {
++		mutex_unlock(&en75_ex20v_iptv_lock);
++		return -ENODEV;
++	}
++	en75_int_sw_apply(en75_ex20v_iptv_eth, en75_ex20v_iptv_dev, lan, vid);
++	en75_ex20v_iptv_lan = lan;
++	en75_ex20v_iptv_vid = vid;
++	mutex_unlock(&en75_ex20v_iptv_lock);
++
++	return len;
++}
++
++static ssize_t en75_ex20v_iptv_read(struct file *file, char __user *ubuf,
++				    size_t len, loff_t *ppos)
++{
++	char buf[32];
++	int n;
++
++	mutex_lock(&en75_ex20v_iptv_lock);
++	n = scnprintf(buf, sizeof(buf), "lan=%d vid=%d\n",
++		     en75_ex20v_iptv_lan, en75_ex20v_iptv_vid);
++	mutex_unlock(&en75_ex20v_iptv_lock);
++
++	return simple_read_from_buffer(ubuf, len, ppos, buf, n);
++}
++
++static const struct file_operations en75_ex20v_iptv_fops = {
++	.open	= simple_open,
++	.read	= en75_ex20v_iptv_read,
++	.write	= en75_ex20v_iptv_write,
++	.llseek	= default_llseek,
++};
++
++static void en75_int_sw_program(struct en75_eth_pvt *eth, struct device *dev)
++{
++	/* Enable CPU port 6 and broadcast/unknown flooding. */
++	en75_gsw_write(eth, MT753X_MFC, EN75_MFC_CONFIG);
++	/* Force the internal GSW CPU port (6) link up. */
++	en75_gsw_write(eth, MT753X_PMCR_P(6), EN75_PMCR_CONFIG);
++
++	/*
++	 * VID 2 = WAN port 4 (untagged fallback) + CPU. VID 35 = TrkTelekom
++	 * PPPoE WAN, same members but both egress TAGGED (VAWD2 0x2200: port4
++	 * EG_CON=2, port6 EG_CON=2) so the VLAN-35 tag survives onto the wire
++	 * to the bridge modem/ONT. eth0.35 (pppoe) rides this; the WAN port
++	 * stays a VID-35 member in security mode so it also accepts the
++	 * modem's VID-35-tagged ingress. Fixed regardless of IPTV state.
++	 */
++	en75_int_sw_vlan(eth, 2, 0x50, 0x2000);	/* members {4,6} */
++	en75_int_sw_vlan(eth, 35, 0x50, 0x2200);
++
++	/* WAN port 4: security mode, PVID 2. */
++	en75_gsw_write(eth, 0x2404, 0x00ff0003);
++	en75_gsw_write(eth, 0x2414, 2);
++	en75_gsw_write(eth, 0x2410, 0x81000000);
++
++	/* CPU port 6: SECURITY mode + matrix 0xff. Matrix mode (0x00ff0000) bypasses the per-VLAN egress-tag context, so tagged VLANs (VID35 TT PPPoE) never carry their tag onto the wire and the modem/DSLAM never replies (TX rises, no PADO); untagged VID1/VID2 are unaffected. The CPU is a member of VID1/2/35 so LAN/WAN keep working. */
++	en75_gsw_write(eth, 0x2604, 0x00ff0003);
++	en75_gsw_write(eth, 0x2610, 0x81000000);
++
++	/* Boot with the carrier IPTV hardware bridge disabled; a userspace
++	 * hook restores the customer's saved choice (if any) right after by
++	 * writing econet_ex20v/iptv, which re-derives VID 1's LAN membership
++	 * and any IPTV VLAN table entry without needing a reboot. */
++	en75_int_sw_apply(eth, dev, 0, 0);
++
++	en75_ex20v_iptv_eth = eth;
++	en75_ex20v_iptv_dev = dev;
++	en75_ex20v_iptv_lan = 0;
++	en75_ex20v_iptv_vid = 0;
++	en75_ex20v_iptv_dir = debugfs_create_dir("econet_ex20v", NULL);
++	debugfs_create_file("iptv", 0644, en75_ex20v_iptv_dir, NULL,
++			    &en75_ex20v_iptv_fops);
++
++	en75_int_sw_dump(eth, dev);
++}
++
+ static int en75_probe(struct platform_device *pdev)
+ {
+ 	struct en75_debug_conf debug_conf = {0};
+@@ -1221,10 +1486,16 @@ static int en75_probe(struct platform_de
+ 				en75_port_enable_ppe_fwd(eth->ports[i], eth->ppe);
+ 	}
+ 
+-	/* Configure the internal GSW as a dumb switch between GDM and TRGMII. */
+-	en75_wreg(EN75_PMCR_CONFIG, &regs->switch_regs[MT753X_PMCR_P(5) / 4]);
+-	en75_wreg(EN75_PMCR_CONFIG, &regs->switch_regs[MT753X_PMCR_P(6) / 4]);
+-	en75_wreg(EN75_MFC_CONFIG, &regs->switch_regs[MT753X_MFC / 4]);
++	if (of_machine_is_compatible("tplink,ex20v")) {
++		/* No external switch: the physical LAN/WAN ports are on the
++		 * SoC-internal GSW. Program it for the WAN/LAN VLAN split. */
++		en75_int_sw_program(eth, &pdev->dev);
++	} else {
++		/* Configure the internal GSW as a dumb switch between GDM and TRGMII. */
++		en75_wreg(EN75_PMCR_CONFIG, &regs->switch_regs[MT753X_PMCR_P(5) / 4]);
++		en75_wreg(EN75_PMCR_CONFIG, &regs->switch_regs[MT753X_PMCR_P(6) / 4]);
++		en75_wreg(EN75_MFC_CONFIG, &regs->switch_regs[MT753X_MFC / 4]);
++	}
+ 
+ 	if (of_property_read_bool(pdev->dev.of_node, "econet,mt7530-vlan-split")) {
+ 		err = en75_trgmii_resync(eth);

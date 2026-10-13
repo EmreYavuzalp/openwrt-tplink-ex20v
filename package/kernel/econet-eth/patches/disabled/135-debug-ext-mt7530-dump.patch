@@ -1,0 +1,84 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: [DEBUG] dump external MT7530 port config + MIB counters
+
+Localise the C5v DSA TX special-tag decimation: read the external MT7530
+(behind the internal GSW + TRGMII) port6 (CPU/TRGMII-facing) and port1 (LAN3)
+config + MIB counters via the raw MDIO master. The port6 RX packet-size
+histogram tells whether a frame arrives full (sz64) or already short
+(undersz/crc) at the external switch, splitting the decimation into
+GDM/TRGMII (before) vs external switch (after).
+
+Trigger: echo 1 > /sys/module/econet_eth/parameters/ext_dump ; dmesg
+
+Signed-off-by: Emre Yavuzalp <emreyavuzalp@gmail.com>
+---
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -38,6 +38,7 @@
+ #include <linux/reset.h>
+ #include <linux/delay.h>
+ #include <linux/of_net.h>
++#include <linux/moduleparam.h>
+ #include <linux/of_mdio.h>
+ #include <linux/phy.h>
+ 
+@@ -368,6 +369,50 @@
+ }
+ 
+ /*
++ * [DEBUG] Dump external MT7530 port config + MIB counters to dmesg, to localise
++ * the TX special-tag decimation (does a frame arrive full or already short at
++ * the external switch?). C5v port map: p6=CPU(TRGMII from internal GSW),
++ * p1=LAN3. Trigger: echo 1 > /sys/module/econet_eth/parameters/ext_dump
++ * NOTE: raw MDIO via PHY_IAC, can race the mt7530 DSA driver's regmap; run
++ * one-shot when quiescent.
++ */
++static u32 __iomem *en75_dbg_sw;
++
++static void en75_dbg_mt7530_dump(u32 __iomem *sw)
++{
++	if (!sw)
++		return;
++	pr_info("ext mt7530: MFC=%08x\n", en75_ext_sw_read(sw, 0x10));
++	pr_info("ext mt7530 p6(cpu):  PCR=%08x PVC=%08x PMCR=%08x PMSR=%08x\n",
++		en75_ext_sw_read(sw, 0x2604), en75_ext_sw_read(sw, 0x2610),
++		en75_ext_sw_read(sw, 0x3600), en75_ext_sw_read(sw, 0x3608));
++	pr_info("ext mt7530 p1(lan3): PCR=%08x PMCR=%08x PMSR=%08x\n",
++		en75_ext_sw_read(sw, 0x2104),
++		en75_ext_sw_read(sw, 0x3100), en75_ext_sw_read(sw, 0x3108));
++	pr_info("ext mt7530 p6 RX: bytes=%08x_%08x sz64=%08x sz65_127=%08x undersz=%08x crc=%08x frag=%08x drop=%08x\n",
++		en75_ext_sw_read(sw, 0x46ac), en75_ext_sw_read(sw, 0x46a8),
++		en75_ext_sw_read(sw, 0x4690), en75_ext_sw_read(sw, 0x4694),
++		en75_ext_sw_read(sw, 0x467c), en75_ext_sw_read(sw, 0x4678),
++		en75_ext_sw_read(sw, 0x4680), en75_ext_sw_read(sw, 0x4660));
++	pr_info("ext mt7530 p1 TX: bytes=%08x_%08x sz64=%08x drop=%08x crc=%08x\n",
++		en75_ext_sw_read(sw, 0x414c), en75_ext_sw_read(sw, 0x4148),
++		en75_ext_sw_read(sw, 0x4130), en75_ext_sw_read(sw, 0x4100),
++		en75_ext_sw_read(sw, 0x4104));
++}
++
++static int en75_ext_dump_set(const char *val, const struct kernel_param *kp)
++{
++	en75_dbg_mt7530_dump(en75_dbg_sw);
++	return 0;
++}
++
++static const struct kernel_param_ops en75_ext_dump_ops = {
++	.set = en75_ext_dump_set,
++};
++module_param_cb(ext_dump, &en75_ext_dump_ops, NULL, 0200);
++MODULE_PARM_DESC(ext_dump, "Write to dump external MT7530 p6/p1 config + MIB to dmesg");
++
++/*
+  * SoC-side GSW (internal switch) direct MMIO accessors. The external MT7530 is
+  * reached with en75_ext_sw_read()/write() above; these reach the SoC GSW that
+  * sits at the other end of the TRGMII link.
+@@ -757,6 +802,8 @@
+ 	en75_wreg(EN75_PMCR_CONFIG, &regs->switch_regs[MT753X_PMCR_P(6) / 4]);
+ 	en75_wreg(EN75_MFC_CONFIG, &regs->switch_regs[MT753X_MFC / 4]);
+ 
++	en75_dbg_sw = regs->switch_regs;
++
+ 	/* Re-sync the TRGMII link (experimental; see en75_trgmii_resync). */
+ 	en75_trgmii_resync(regs->switch_regs);
+ 

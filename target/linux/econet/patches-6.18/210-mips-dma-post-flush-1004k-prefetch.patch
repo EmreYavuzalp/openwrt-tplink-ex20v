@@ -1,0 +1,58 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: mips: DMA: post-DMA cache flush on 1004K/34K without IOCU
+
+EcoNet EN7528 (dual-core 1004Kc, 4 VPEs) and EN751221 (34Kc, 2 VPEs)
+have CONFIG_CPU_HAS_PREFETCH but no IOCU, so device DMA does not snoop
+the L1/L2 caches. Linux only performs arch_sync_dma_for_cpu() when
+cpu_needs_post_dma_flush() is true; 1004K/34K are not in that list and
+do not implement MAAR, so dma_sync_single_for_cpu() is a no-op.
+
+On SMP a foreign core can speculatively fill a DMA buffer (page_pool
+recycle, skb head, etc.) while the engine is still writing. The stale
+line later writebacks over a kmem_cache object — seen as:
+
+  CPU n Unable to handle kernel paging request
+  kmem_cache_alloc_noprof / inet_twsk_alloc
+  Kernel panic - not syncing: Fatal exception in interrupt
+
+after a Wi-Fi client joins and generates TCP TIME_WAIT churn. maxcpus=1
+hides it by removing the other L1; it is not a driver regression.
+
+Treat 1004K and 34K like BMIPS5000: invalidate after DMA_FROM_DEVICE,
+and write back the L2 lines at the buffer edges on 1004K (it has an
+inclusive scache; 34Kc typically does not).
+
+Signed-off-by: Emre Yavuzalp <emreyavuzalp@gmail.com>
+--- a/arch/mips/mm/dma-noncoherent.c
++++ b/arch/mips/mm/dma-noncoherent.c
+@@ -31,8 +31,16 @@ static inline bool cpu_needs_post_dma_flush(void)
+ 	case CPU_R10000:
+ 	case CPU_R12000:
+ 	case CPU_BMIPS5000:
+ 	case CPU_LOONGSON2EF:
+ 	case CPU_XBURST:
++	/*
++	 * 1004Kc (EN7528) and 34Kc (EN751221) implement prefetch but
++	 * EcoNet parts have no IOCU, so DMA is not hardware-coherent.
++	 * Post-DMA invalidate is required on SMP or recycled buffers
++	 * write back into the slab allocator.
++	 */
++	case CPU_1004K:
++	case CPU_34K:
+ 		return true;
+ 	default:
+ 		/*
+ 		 * Presence of MAARs suggests that the CPU supports
+--- a/arch/mips/mm/c-r4k.c
++++ b/arch/mips/mm/c-r4k.c
+@@ -828,8 +828,9 @@ static void r4k_dma_cache_inv(unsigned long addr, unsigned long size)
+ 
+ 	preempt_disable();
+ 
+-	if (current_cpu_type() == CPU_BMIPS5000)
++	if (current_cpu_type() == CPU_BMIPS5000 ||
++	    current_cpu_type() == CPU_1004K)
+ 		prefetch_cache_inv(addr, size);
+ 
+ 	if (cpu_has_inclusive_pcaches) {
+ 		if (size >= scache_size) {

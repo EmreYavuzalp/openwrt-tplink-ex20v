@@ -1,0 +1,2 @@
+Vendored from https://github.com/VizzleTF/luci-theme-footstrap (luci-theme-footstrap/ subdirectory), commit 400a167, Apache-2.0.
+Local change: root/etc/uci-defaults/30_luci-theme-footstrap no longer sets luci.main.mediaurlbase (Argon stays the default theme).

@@ -1,0 +1,71 @@
+#!/bin/sh
+# TP-Link EX20v: varsayılan WiFi ayarı (fabrika/ilk boot).
+#  - SSID her cihaza özel: EX20v_OpenWrt_<son4>_2.4GHz / _5GHz
+#    <son4> = TP-Link "serial" (= label MAC = base MAC + 2) son 2 okteti (ör. 1368).
+#  - Her iki radyo AÇIK (disabled=0) gelir; şifre WPA2 sabit "12345678".
+#
+# Yalnız TAZE/varsayılan ("OpenWrt" ya da boş) SSID'lere dokunur; kullanıcının
+# elle verdiği isimleri EZMEZ (sysupgrade'de ayar korunursa güvenli).
+# config_generate wireless'ı üretmemişse (ilk boot) önce üretiriz.
+
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "tplink,ex20v" ] || exit 0
+
+. /lib/functions.sh
+. /lib/functions/system.sh
+
+[ -e /etc/config/wireless ] || /sbin/wifi config
+[ -e /etc/config/wireless ] || exit 0
+
+# base MAC (eth0 = romfile) -> label MAC (base+2) -> son 2 oktet, büyük harf hex
+base=$(cat /sys/class/net/eth0/address 2>/dev/null)
+[ -n "$base" ] || exit 0
+label=$(macaddr_add "$base" 2)
+suf="${label#*:*:*:*:}"          # "13:68"
+suf="${suf%:*}${suf#*:}"         # "1368"
+suf=$(echo "$suf" | tr 'a-f' 'A-F')
+[ -n "$suf" ] || exit 0
+
+changed=0
+
+setup_iface() {
+	local sect="$1" dev band lbl cur
+	config_get dev "$sect" device
+	[ -n "$dev" ] || return 0
+
+	# Sadece taze/varsayılan SSID'leri değiştir (kullanıcı özelini koru).
+	cur=$(uci -q get wireless."$sect".ssid)
+	case "$cur" in
+		""|OpenWrt) ;;
+		*) return 0 ;;
+	esac
+
+	band=$(uci -q get wireless."$dev".band)
+	case "$band" in
+		5g|5G) lbl="5GHz" ;;
+		*)     lbl="2.4GHz" ;;
+	esac
+
+	uci -q set wireless."$sect".ssid="EX20v_OpenWrt_${suf}_${lbl}"
+	uci -q set wireless."$sect".encryption='sae-mixed'
+	uci -q set wireless."$sect".key='12345678'
+	# Yeni ucode wifi generator (mac80211.uc:115) 'disabled' bayrağını
+	# wifi-IFACE'e koyuyor (board default'u yoksa =1). ASIL etkinleştirme bu:
+	uci -q set wireless."$sect".disabled='0'
+	# Device'da da varsa temizle (bazı sürüm/config'lerde radyo seviyesinde).
+	uci -q set wireless."$dev".disabled='0'
+	# Ülke kodu TR (regulatory) + 2.4GHz'i 802.11n/HT20 yap. MT7915 2.4G'de
+	# varsayılan HE20 (AX/WiFi6) geliyor; bazı eski cihazlar 2.4G AX'e sorunlu
+	# bağlanıyor, bu yüzden 2.4GHz'i HT20 (N) sabitliyoruz. 5GHz HE/AX kalır.
+	uci -q set wireless."$dev".country='TR'
+	case "$band" in
+		2g|2G) uci -q set wireless."$dev".htmode='HT20' ;;
+	esac
+	changed=1
+}
+
+config_load wireless
+config_foreach setup_iface wifi-iface
+
+[ "$changed" = 1 ] && uci -q commit wireless
+
+exit 0

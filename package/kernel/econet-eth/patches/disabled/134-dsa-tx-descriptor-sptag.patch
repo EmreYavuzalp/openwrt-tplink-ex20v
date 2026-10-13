@@ -1,0 +1,115 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: descriptor-based DSA special-tag TX (EN751221)
+
+EN751221's frame engine corrupts (decimates) an in-band MTK special tag on
+the CPU->switch TX path, so the mainline tag_mtk tagger works for RX but not
+TX. Implement the descriptor-based path the driver author stubbed as
+"TODO DSA": strip the in-band tag the tagger inserted and have the GDM
+re-insert the MTK special tag from the TX descriptor's sp_tag field
+(GDM_VLAN_TTX + gdm_vlan.tpid). Only frames the tagger tagged are touched
+(EtherType < 0x0600), so the conduit's own untagged frames are left alone.
+
+The exact sp_tag encoding for the cascade (internal GSW + external MT7530)
+is undocumented (proprietary FE blob), so the TPID and sp_tag encoding are
+exposed as live-tunable module parameters for on-hardware characterisation:
+  /sys/module/econet_eth/parameters/dsa_sptag{,_tpid,_mode}
+
+Signed-off-by: Emre Yavuzalp <emreyavuzalp@gmail.com>
+---
+--- a/econet_port.c
++++ b/econet_port.c
+@@ -12,6 +12,27 @@
+ #include <linux/platform_device.h>
+ #include <linux/reset.h>
+ #include <linux/of_net.h>
++#include <linux/swab.h>
++
++/*
++ * Descriptor-based DSA special-tag TX.
++ *
++ * EN751221's frame engine mangles an in-band MTK (tag_mtk) special tag on the
++ * CPU->switch path (TX payload decimation). Instead, strip the in-band tag the
++ * DSA tagger inserted and have the GDM re-insert the MTK special tag from the
++ * TX descriptor's sp_tag field (GDM_VLAN_TTX). The exact sp_tag encoding is
++ * being characterised on hardware, so the knobs below are live-tunable via
++ * /sys/module/econet_eth/parameters/.
++ */
++static int dsa_sptag = 1;
++module_param(dsa_sptag, int, 0644);
++MODULE_PARM_DESC(dsa_sptag, "DSA: strip in-band MTK tag, insert via descriptor sp_tag");
++static int dsa_sptag_tpid;
++module_param(dsa_sptag_tpid, int, 0644);
++MODULE_PARM_DESC(dsa_sptag_tpid, "DSA: GDM insert-tag TPID (gdm_vlan.tpid)");
++static int dsa_sptag_mode;
++module_param(dsa_sptag_mode, int, 0644);
++MODULE_PARM_DESC(dsa_sptag_mode, "DSA: sp_tag encoding mode 0..3");
+ 
+ #include "econet_eth.h"
+ #include "gdm_regs.h"
+@@ -159,15 +180,18 @@
+ 	}
+ #endif
+ 
+-	// TODO DSA
+-	// if (netdev_uses_dsa(dev))
+-	// 	airoha_fe_set(qdma->eth, REG_GDM_INGRESS_CFG(port->id),
+-	// 		      GDM_STAG_EN_MASK);
+-	// else
+-	// 	airoha_fe_clear(qdma->eth, REG_GDM_INGRESS_CFG(port->id),
+-	// 			GDM_STAG_EN_MASK);
+-
+ 	guard(spinlock)(&port->reg_lock);
++
++	/* Descriptor-based DSA TX: make the GDM insert the MTK special tag on
++	 * egress, taking the per-frame value from the TX descriptor sp_tag. */
++	if (dsa_sptag && netdev_uses_dsa(dev)) {
++		struct gdm_vlan vlan = en75_rreg(&port->regs->vlan);
++
++		vlan.tpid = (u16)dsa_sptag_tpid;
++		set_gdm_vlan_ttx(&vlan, true);
++		set_gdm_vlan_urx(&vlan, false);
++		en75_wreg(vlan, &port->regs->vlan);
++	}
+ 	rlt = en75_rreg(&port->regs->rx_len_threshold);
+ 	set_gdm_len_th_runt_len(&rlt, 60);
+ 	set_gdm_len_th_oversize_len(&rlt, ETH_HLEN + dev->mtu + ETH_FCS_LEN);
+@@ -212,6 +236,39 @@
+ 	set_etx_queue(&msg.etx, qid % EN75_NUM_QUEUES);
+ 	set_etx_fport(&msg.etx, port->fport);
+ 
++	/* Move the DSA tagger's in-band MTK tag into the descriptor so the GDM
++	 * re-inserts it on egress (the FE mangles it if left in-band). Only the
++	 * tagger's frames carry a sub-0x0600 value where the EtherType would be;
++	 * leave the conduit's own untagged frames (real EtherType) untouched. */
++	if (dsa_sptag && netdev_uses_dsa(dev) &&
++	    skb->len >= 2 * ETH_ALEN + 4 &&
++	    (((u16)skb->data[2 * ETH_ALEN] << 8) |
++	     skb->data[2 * ETH_ALEN + 1]) < ETH_P_802_3_MIN) {
++		u8 *t = skb->data + 2 * ETH_ALEN;
++		u16 a = ((u16)t[0] << 8) | t[1];
++		u16 b = ((u16)t[2] << 8) | t[3];
++		u16 sp;
++
++		switch (dsa_sptag_mode) {
++		default:
++		case 0: sp = a; break;
++		case 1: sp = swab16(a); break;
++		case 2: sp = b; break;
++		case 3: sp = swab16(b); break;
++		}
++		set_etx_sp_tag(&msg.etx, sp);
++
++		if (net_ratelimit())
++			netdev_info(dev,
++				    "dsa tx: inband=%02x%02x%02x%02x -> sp_tag=0x%04x (mode %d tpid 0x%04x)\n",
++				    t[0], t[1], t[2], t[3], sp, dsa_sptag_mode,
++				    (u16)dsa_sptag_tpid);
++
++		memmove(skb->data + 4, skb->data, 2 * ETH_ALEN);
++		skb_pull(skb, 4);
++		len = skb->len;
++	}
++
+ 	txq = netdev_get_tx_queue(dev, qid);
+ 
+ 	/* Non-linear skbs are unsupported, we shouldn't get them but

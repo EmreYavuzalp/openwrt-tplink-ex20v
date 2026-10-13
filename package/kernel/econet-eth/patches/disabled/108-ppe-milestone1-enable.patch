@@ -1,0 +1,381 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: bring up the PPE with an empty FOE table (milestone 1)
+
+The EN751221 Packet Processing Engine is register- and FOE-entry
+compatible with the MediaTek "netsys v1" PPE (mt7621 class): 80-byte
+entries, 16384 of them, and the same register block, here at offset
+0x200 within the ppe[] window mapped at 0xBFB50C00. This was confirmed
+by disassembling the vendor hw_nat.ko (its PpeRegDump prints the MTK
+register names at these exact offsets) and cross-checking the mainline
+mtk_ppe_regs.h.
+
+This first step only allocates the FOE table and enables the engine
+with no bound flows. Because the GDM forwarding is left untouched, no
+packet is ever steered into the PPE, so the datapath is unchanged; the
+purpose is to validate register access, the 1.25 MB coherent FOE table
+allocation and engine enable (visible via the dev_info() readback of
+GLO_CFG/TB_CFG). Flow binding via nf_flowtable follows in a later patch.
+
+The register programming mirrors mtk_ppe_start()'s netsys-v1 path. The
+code is kept native to this driver rather than reusing mtk_ppe.c to
+avoid pulling in the struct mtk_eth coupling.
+
+Signed-off-by: Emre Yavuzalp <emreyavuzalp@gmail.com>
+---
+--- /dev/null
++++ b/econet_ppe.h
+@@ -0,0 +1,137 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Packet Processing Engine (PPE) for the EcoNet EN751221.
++ *
++ * The EN751221 PPE is register- and FOE-entry-compatible with the MediaTek
++ * "netsys v1" PPE (mt7621 class): 80-byte FOE entries, 16384 entries, and the
++ * same register block laid out at offset 0x200 within the PPE window that
++ * econet_eth.c maps as en751221_regs.ppe (0xBFB50C00). The accessors and
++ * register definitions below mirror the mainline mtk_ppe driver but are kept
++ * native to this driver to avoid pulling in the struct mtk_eth coupling.
++ *
++ * Milestone 1: bring the engine up against an empty FOE table. With no bound
++ * entries and the GDM forwarding left untouched, no packet is ever steered to
++ * the PPE, so the datapath is unchanged; this only validates register access,
++ * FOE table allocation and engine enable.
++ */
++#ifndef ECONET_PPE_H
++#define ECONET_PPE_H
++
++#include <linux/bitfield.h>
++#include <linux/types.h>
++
++struct device;
++
++/* 1024 << 4 = 16384 entries, matching the vendor gPpeFoeNum. */
++#define EN75_PPE_ENTRIES_SHIFT		4
++#define EN75_PPE_ENTRIES		(1024 << EN75_PPE_ENTRIES_SHIFT)
++
++/* Register offsets, relative to the start of the ppe[] window. */
++#define EN75_PPE_GLO_CFG		0x200
++#define EN75_PPE_GLO_CFG_EN			BIT(0)
++#define EN75_PPE_GLO_CFG_IP4_L4_CS_DROP		BIT(2)
++#define EN75_PPE_GLO_CFG_IP4_CS_DROP		BIT(3)
++#define EN75_PPE_GLO_CFG_FLOW_DROP_UPDATE	BIT(9)
++#define EN75_PPE_GLO_CFG_BUSY			BIT(31)
++
++#define EN75_PPE_FLOW_CFG		0x204
++#define EN75_PPE_FLOW_CFG_IP4_TCP_FRAG		BIT(6)
++#define EN75_PPE_FLOW_CFG_IP4_UDP_FRAG		BIT(7)
++#define EN75_PPE_FLOW_CFG_IP6_3T_ROUTE		BIT(8)
++#define EN75_PPE_FLOW_CFG_IP6_5T_ROUTE		BIT(9)
++#define EN75_PPE_FLOW_CFG_IP6_6RD		BIT(10)
++#define EN75_PPE_FLOW_CFG_IP4_NAT		BIT(12)
++#define EN75_PPE_FLOW_CFG_IP4_NAPT		BIT(13)
++#define EN75_PPE_FLOW_CFG_IP4_DSLITE		BIT(14)
++#define EN75_PPE_FLOW_CFG_IP4_NAT_FRAG		BIT(17)
++
++#define EN75_PPE_IP_PROTO_CHK		0x208
++#define EN75_PPE_IP_PROTO_CHK_IPV4		GENMASK(15, 0)
++#define EN75_PPE_IP_PROTO_CHK_IPV6		GENMASK(31, 16)
++
++#define EN75_PPE_TB_CFG			0x21c
++#define EN75_PPE_TB_CFG_ENTRY_NUM		GENMASK(2, 0)
++#define EN75_PPE_TB_CFG_ENTRY_80B		BIT(3)
++#define EN75_PPE_TB_CFG_SEARCH_MISS		GENMASK(5, 4)
++#define EN75_PPE_TB_CFG_AGE_NON_L4		BIT(7)
++#define EN75_PPE_TB_CFG_AGE_UNBIND		BIT(8)
++#define EN75_PPE_TB_CFG_AGE_TCP			BIT(9)
++#define EN75_PPE_TB_CFG_AGE_UDP			BIT(10)
++#define EN75_PPE_TB_CFG_AGE_TCP_FIN		BIT(11)
++#define EN75_PPE_TB_CFG_KEEPALIVE		GENMASK(13, 12)
++#define EN75_PPE_TB_CFG_HASH_MODE		GENMASK(15, 14)
++#define EN75_PPE_TB_CFG_SCAN_MODE		GENMASK(17, 16)
++
++/* Field values (see mainline mtk_ppe_regs.h enums). */
++#define EN75_PPE_SCAN_MODE_CHECK_AGE		1
++#define EN75_PPE_KEEPALIVE_DISABLE		0
++#define EN75_PPE_SEARCH_MISS_ACTION_FORWARD_BUILD	3
++
++#define EN75_PPE_TB_USED		0x224
++
++#define EN75_PPE_TB_BASE		0x220
++
++#define EN75_PPE_BIND_RATE		0x228
++#define EN75_PPE_BIND_RATE_BIND			GENMASK(15, 0)
++#define EN75_PPE_BIND_RATE_PREBIND		GENMASK(31, 16)
++
++#define EN75_PPE_BIND_LIMIT0		0x22c
++#define EN75_PPE_BIND_LIMIT0_QUARTER		GENMASK(13, 0)
++#define EN75_PPE_BIND_LIMIT0_HALF		GENMASK(29, 16)
++
++#define EN75_PPE_BIND_LIMIT1		0x230
++#define EN75_PPE_BIND_LIMIT1_FULL		GENMASK(13, 0)
++#define EN75_PPE_BIND_LIMIT1_NON_L4		GENMASK(23, 16)
++
++#define EN75_PPE_KEEPALIVE		0x234
++
++#define EN75_PPE_UNBIND_AGE		0x238
++#define EN75_PPE_UNBIND_AGE_MIN_PACKETS		GENMASK(31, 16)
++#define EN75_PPE_UNBIND_AGE_DELTA		GENMASK(7, 0)
++
++#define EN75_PPE_BIND_AGE0		0x23c
++#define EN75_PPE_BIND_AGE0_DELTA_NON_L4		GENMASK(30, 16)
++#define EN75_PPE_BIND_AGE0_DELTA_UDP		GENMASK(14, 0)
++
++#define EN75_PPE_BIND_AGE1		0x240
++#define EN75_PPE_BIND_AGE1_DELTA_TCP_FIN	GENMASK(30, 16)
++#define EN75_PPE_BIND_AGE1_DELTA_TCP		GENMASK(14, 0)
++
++#define EN75_PPE_DEFAULT_CPU_PORT	0x248
++
++#define EN75_PPE_CACHE_CTL		0x320
++#define EN75_PPE_CACHE_CTL_EN			BIT(0)
++
++/** A hardware FOE (Flow Offload Engine) table entry: 80 bytes (20 words). */
++struct en75_foe_entry {
++	u32 data[20];
++};
++
++_Static_assert(sizeof(struct en75_foe_entry) == 80,
++	       "FOE entry must be 80 bytes (MTK v1 layout)");
++
++/** Per-PPE runtime state. */
++struct en75_ppe {
++	struct device		*dev;
++	void __iomem		*base;
++	struct en75_foe_entry	*foe;
++	dma_addr_t		foe_phys;
++};
++
++/**
++ * en75_ppe_init() - allocate the FOE table and the PPE state.
++ * @dev:  device used for the coherent DMA allocation (devm managed).
++ * @base: ioremapped base of the ppe[] register window.
++ *
++ * Returns the PPE state on success or an ERR_PTR() on failure. The engine is
++ * not started here; call en75_ppe_start() afterwards.
++ */
++struct en75_ppe *en75_ppe_init(struct device *dev, void __iomem *base);
++
++/** en75_ppe_start() - program the registers and enable the engine. */
++void en75_ppe_start(struct en75_ppe *ppe);
++
++/** en75_ppe_stop() - disable the engine (safe to call before module unload). */
++void en75_ppe_stop(struct en75_ppe *ppe);
++
++#endif /* ECONET_PPE_H */
+--- /dev/null
++++ b/econet_ppe.c
+@@ -0,0 +1,159 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Packet Processing Engine (PPE) bring-up for the EcoNet EN751221.
++ *
++ * See econet_ppe.h for the relationship to the mainline MediaTek PPE. This
++ * file implements milestone 1 only: allocate the FOE table and enable the
++ * engine with no bound flows. Flow binding (nf_flowtable offload) is added in
++ * a later change.
++ */
++#include <linux/device.h>
++#include <linux/dma-mapping.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++
++#include "econet_ppe.h"
++
++#define EN75_PPE_WAIT_TIMEOUT_US	1000000
++
++static inline u32 ppe_r32(struct en75_ppe *ppe, u32 reg)
++{
++	return readl(ppe->base + reg);
++}
++
++static inline void ppe_w32(struct en75_ppe *ppe, u32 reg, u32 val)
++{
++	writel(val, ppe->base + reg);
++}
++
++static int ppe_wait_busy(struct en75_ppe *ppe)
++{
++	u32 val;
++	int ret;
++
++	ret = readl_poll_timeout(ppe->base + EN75_PPE_GLO_CFG, val,
++				 !(val & EN75_PPE_GLO_CFG_BUSY),
++				 20, EN75_PPE_WAIT_TIMEOUT_US);
++	if (ret)
++		dev_err(ppe->dev, "PPE table busy\n");
++
++	return ret;
++}
++
++struct en75_ppe *en75_ppe_init(struct device *dev, void __iomem *base)
++{
++	struct en75_ppe *ppe;
++
++	ppe = devm_kzalloc(dev, sizeof(*ppe), GFP_KERNEL);
++	if (!ppe)
++		return ERR_PTR(-ENOMEM);
++
++	ppe->dev = dev;
++	ppe->base = base;
++
++	ppe->foe = dmam_alloc_coherent(dev,
++				       EN75_PPE_ENTRIES * sizeof(*ppe->foe),
++				       &ppe->foe_phys, GFP_KERNEL);
++	if (!ppe->foe)
++		return ERR_PTR(-ENOMEM);
++
++	return ppe;
++}
++
++void en75_ppe_start(struct en75_ppe *ppe)
++{
++	u32 val;
++
++	if (IS_ERR_OR_NULL(ppe))
++		return;
++
++	/* Point the engine at the (zeroed) FOE table. */
++	ppe_w32(ppe, EN75_PPE_TB_BASE, ppe->foe_phys);
++
++	val = EN75_PPE_TB_CFG_AGE_NON_L4 |
++	      EN75_PPE_TB_CFG_AGE_UNBIND |
++	      EN75_PPE_TB_CFG_AGE_TCP |
++	      EN75_PPE_TB_CFG_AGE_UDP |
++	      EN75_PPE_TB_CFG_AGE_TCP_FIN |
++	      FIELD_PREP(EN75_PPE_TB_CFG_SEARCH_MISS,
++			 EN75_PPE_SEARCH_MISS_ACTION_FORWARD_BUILD) |
++	      FIELD_PREP(EN75_PPE_TB_CFG_KEEPALIVE,
++			 EN75_PPE_KEEPALIVE_DISABLE) |
++	      FIELD_PREP(EN75_PPE_TB_CFG_HASH_MODE, 1) |
++	      FIELD_PREP(EN75_PPE_TB_CFG_SCAN_MODE,
++			 EN75_PPE_SCAN_MODE_CHECK_AGE) |
++	      FIELD_PREP(EN75_PPE_TB_CFG_ENTRY_NUM, EN75_PPE_ENTRIES_SHIFT) |
++	      EN75_PPE_TB_CFG_ENTRY_80B;
++	ppe_w32(ppe, EN75_PPE_TB_CFG, val);
++
++	ppe_w32(ppe, EN75_PPE_IP_PROTO_CHK,
++		EN75_PPE_IP_PROTO_CHK_IPV4 | EN75_PPE_IP_PROTO_CHK_IPV6);
++
++	/* Enable the FOE cache; the table is freshly zeroed so nothing is
++	 * stale to flush.
++	 */
++	ppe_w32(ppe, EN75_PPE_CACHE_CTL, EN75_PPE_CACHE_CTL_EN);
++
++	val = EN75_PPE_FLOW_CFG_IP6_3T_ROUTE |
++	      EN75_PPE_FLOW_CFG_IP6_5T_ROUTE |
++	      EN75_PPE_FLOW_CFG_IP6_6RD |
++	      EN75_PPE_FLOW_CFG_IP4_NAT |
++	      EN75_PPE_FLOW_CFG_IP4_NAPT |
++	      EN75_PPE_FLOW_CFG_IP4_DSLITE |
++	      EN75_PPE_FLOW_CFG_IP4_NAT_FRAG |
++	      EN75_PPE_FLOW_CFG_IP4_TCP_FRAG |
++	      EN75_PPE_FLOW_CFG_IP4_UDP_FRAG;
++	ppe_w32(ppe, EN75_PPE_FLOW_CFG, val);
++
++	val = FIELD_PREP(EN75_PPE_UNBIND_AGE_MIN_PACKETS, 1000) |
++	      FIELD_PREP(EN75_PPE_UNBIND_AGE_DELTA, 3);
++	ppe_w32(ppe, EN75_PPE_UNBIND_AGE, val);
++
++	val = FIELD_PREP(EN75_PPE_BIND_AGE0_DELTA_UDP, 12) |
++	      FIELD_PREP(EN75_PPE_BIND_AGE0_DELTA_NON_L4, 1);
++	ppe_w32(ppe, EN75_PPE_BIND_AGE0, val);
++
++	val = FIELD_PREP(EN75_PPE_BIND_AGE1_DELTA_TCP_FIN, 1) |
++	      FIELD_PREP(EN75_PPE_BIND_AGE1_DELTA_TCP, 7);
++	ppe_w32(ppe, EN75_PPE_BIND_AGE1, val);
++
++	val = EN75_PPE_BIND_LIMIT0_QUARTER | EN75_PPE_BIND_LIMIT0_HALF;
++	ppe_w32(ppe, EN75_PPE_BIND_LIMIT0, val);
++
++	val = EN75_PPE_BIND_LIMIT1_FULL |
++	      FIELD_PREP(EN75_PPE_BIND_LIMIT1_NON_L4, 1);
++	ppe_w32(ppe, EN75_PPE_BIND_LIMIT1, val);
++
++	val = FIELD_PREP(EN75_PPE_BIND_RATE_BIND, 30) |
++	      FIELD_PREP(EN75_PPE_BIND_RATE_PREBIND, 1);
++	ppe_w32(ppe, EN75_PPE_BIND_RATE, val);
++
++	val = EN75_PPE_GLO_CFG_EN |
++	      EN75_PPE_GLO_CFG_IP4_L4_CS_DROP |
++	      EN75_PPE_GLO_CFG_IP4_CS_DROP |
++	      EN75_PPE_GLO_CFG_FLOW_DROP_UPDATE;
++	ppe_w32(ppe, EN75_PPE_GLO_CFG, val);
++
++	/* Default CPU port for punted (unbound / miss) traffic. */
++	ppe_w32(ppe, EN75_PPE_DEFAULT_CPU_PORT, 0);
++
++	ppe_wait_busy(ppe);
++
++	dev_info(ppe->dev,
++		 "PPE enabled: %u FOE entries @ %pad, GLO_CFG=%#x TB_CFG=%#x\n",
++		 EN75_PPE_ENTRIES, &ppe->foe_phys,
++		 ppe_r32(ppe, EN75_PPE_GLO_CFG),
++		 ppe_r32(ppe, EN75_PPE_TB_CFG));
++}
++
++void en75_ppe_stop(struct en75_ppe *ppe)
++{
++	if (IS_ERR_OR_NULL(ppe))
++		return;
++
++	ppe_w32(ppe, EN75_PPE_CACHE_CTL, 0);
++	ppe_w32(ppe, EN75_PPE_GLO_CFG, 0);
++	ppe_wait_busy(ppe);
++}
+--- a/Kbuild
++++ b/Kbuild
+@@ -1,2 +1,2 @@
+ obj-m := econet-eth.o
+-econet-eth-y := econet_eth.o econet_eth_debug.o econet_qdma.o econet_port.o
+\ Dosya sonunda yenisatır yok
++econet-eth-y := econet_eth.o econet_eth_debug.o econet_qdma.o econet_port.o econet_ppe.o
+\ Dosya sonunda yenisatır yok
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -40,6 +40,7 @@
+ #include <linux/of_net.h>
+ 
+ #include "gdm_regs.h"
++#include "econet_ppe.h"
+ #include "linux/dev_printk.h"
+ #include "linux/ioport.h"
+ #include "linux/mdio.h"
+@@ -98,6 +99,7 @@
+ 	int				qdma_irq[EN75_NUM_QDMA * QDMA_NUM_IRQS];
+ 	struct en75_qdma		*qdma[EN75_NUM_QDMA];
+ 	struct en75_debug		*debug;
++	struct en75_ppe			*ppe;
+ };
+ 
+ union gdm_regs {
+@@ -281,6 +283,8 @@
+ 	if (!eth)
+ 		return;
+ 
++	en75_ppe_stop(eth->ppe);
++
+ 	en75_debugfs_exit(eth->debug);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
+@@ -508,6 +512,19 @@
+ 
+ 	eth->debug = en75_debugfs_init(&debug_conf);
+ 
++	/* The PPE is optional: if it cannot be brought up (e.g. the FOE
++	 * table allocation fails) carry on without hardware offload rather
++	 * than failing the whole device.
++	 */
++	eth->ppe = en75_ppe_init(&pdev->dev, eth->regs->ppe);
++	if (IS_ERR(eth->ppe)) {
++		dev_warn(&pdev->dev, "PPE init failed (%pe), offload disabled\n",
++			 eth->ppe);
++		eth->ppe = NULL;
++	} else {
++		en75_ppe_start(eth->ppe);
++	}
++
+ 	/* Configure the MT7530 as a dumb switch */
+ 	en75_wreg(EN75_PMCR_CONFIG, &regs->switch_regs[MT753X_PMCR_P(5) / 4]);
+ 	en75_wreg(EN75_PMCR_CONFIG, &regs->switch_regs[MT753X_PMCR_P(6) / 4]);

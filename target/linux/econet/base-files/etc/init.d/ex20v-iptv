@@ -1,0 +1,47 @@
+#!/bin/sh /etc/rc.common
+# EX20v: apply the saved carrier-IPTV hardware-bridge choice (Tivibu VLAN
+# 55 / Superonline VLAN 103 on one LAN socket) -- at boot, and on demand
+# from LuCI right after the customer changes it.
+#
+# The econet-eth kernel module always comes up with the bridge disabled
+# (every LAN port plain VID 1); it exposes a debugfs knob
+# (econet_ex20v/iptv) to reprogram the switch live, with no reboot or
+# network restart, but has no notion of UCI or persistence itself. This
+# script is the userspace half: boot() runs it once at every real boot
+# (procd calls boot() instead of start() during the boot sequence); the
+# "Kolay Kurulum" LuCI page calls "start" directly (via fs.exec) right
+# after saving the UCI, for an instant, reboot-free preview.
+
+START=95
+STOP=10
+
+IPTV_SYSFS=/sys/kernel/debug/econet_ex20v/iptv
+
+apply_ex20v_iptv() {
+	[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "tplink,ex20v" ] || return 0
+	[ -w "$IPTV_SYSFS" ] || return 0
+
+	local lan vid
+	lan="$(uci -q get ex20v_iptv.main.lan)"
+	vid="$(uci -q get ex20v_iptv.main.vid)"
+	lan="${lan:-0}"
+	vid="${vid:-0}"
+
+	if [ "$lan" = 0 ]; then
+		echo 0 > "$IPTV_SYSFS" 2>/dev/null
+	else
+		echo "$lan $vid" > "$IPTV_SYSFS" 2>/dev/null
+	fi
+}
+
+start() {
+	apply_ex20v_iptv
+}
+
+boot() {
+	apply_ex20v_iptv
+}
+
+stop() {
+	:
+}

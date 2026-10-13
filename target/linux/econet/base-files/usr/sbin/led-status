@@ -1,0 +1,71 @@
+#!/bin/sh
+# EcoNet ön panel LED durum daemon'u (firmware'e gömülü). Cihazlar arası ORTAK.
+#  - <renk>:wan         : fiziksel WAN portu link (varsa; C5v'de blue:wan)
+#  - <renk>:wan-online  : internete çıkış var  (C5v=mavi, EX20v=yeşil)
+#  - red:wan            : internet yok (kırmızı)
+# İnternet LED'i çift renkli tek fiziksel LED: online rengi yakılır / red söner (ya da tersi).
+# Online LED rengi cihaza göre değişir; mavi ya da yeşil hangisi varsa o kullanılır.
+# İlgili LED'ler yoksa (başka econet cihazı) sessizce çıkar.
+
+WAN_LINK=/sys/module/econet_eth/parameters/wan_link
+LEDS=/sys/class/leds
+
+# "internete çıkış var" LED'i: mavi (C5v) ya da yeşil (EX20v) — hangisi varsa
+if   [ -d "$LEDS/blue:wan-online" ];  then ONLINE="blue:wan-online"
+elif [ -d "$LEDS/green:wan-online" ]; then ONLINE="green:wan-online"
+else ONLINE=""
+fi
+# WAN portu link LED'i (yalnız C5v'de var; EX20v'de yok)
+if   [ -d "$LEDS/blue:wan" ];  then WANLED="blue:wan"
+elif [ -d "$LEDS/green:wan" ]; then WANLED="green:wan"
+else WANLED=""
+fi
+
+# İnternet göstergesi için ne online ne de kırmızı LED yoksa daemon'a gerek yok
+[ -n "$ONLINE" ] || [ -d "$LEDS/red:wan" ] || exit 0
+
+set_led() {
+	[ -n "$1" ] || return
+	[ -d "$LEDS/$1" ] || return
+	echo none > "$LEDS/$1/trigger" 2>/dev/null
+	echo "$2" > "$LEDS/$1/brightness" 2>/dev/null
+}
+
+# trigger'ları kapat (manuel kontrol)
+set_led "$WANLED" 0
+set_led "$ONLINE" 0
+set_led "red:wan" 0
+
+set_internet() {   # $1 = 1 (var) / 0 (yok)
+	if [ "$1" = "$last_net" ]; then return; fi
+	set_led "$ONLINE" "$1"
+	set_led "red:wan" "$([ "$1" = 1 ] && echo 0 || echo 1)"
+	last_net="$1"
+}
+
+i=0
+last_link=-1
+last_net=-1
+while : ; do
+	# WAN portu kablo/link (her döngü, ucuz lokal okuma) — LED varsa
+	if [ -n "$WANLED" ] && [ -e "$WAN_LINK" ]; then
+		link=$(cat "$WAN_LINK" 2>/dev/null)
+		[ "$link" != "$last_link" ] && { set_led "$WANLED" "$link"; last_link="$link"; }
+	fi
+
+	# internet durumu:
+	#  - default route yoksa => kesin internet yok, ANINDA kırmızı (lokal, pingsiz)
+	#  - route varsa => 30 sn'de bir ping ile gerçek erişimi teyit et
+	if ! ip route show default 2>/dev/null | grep -q .; then
+		set_internet 0
+	elif [ $((i % 10)) -eq 0 ]; then
+		if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; then
+			set_internet 1
+		else
+			set_internet 0
+		fi
+	fi
+
+	i=$((i + 1))
+	sleep 3
+done

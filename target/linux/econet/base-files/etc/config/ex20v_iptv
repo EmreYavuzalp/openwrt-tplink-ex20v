@@ -1,0 +1,4 @@
+
+config iptv 'main'
+	option lan '0'
+	option vid '0'

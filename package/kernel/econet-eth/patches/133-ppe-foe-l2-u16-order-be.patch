@@ -1,0 +1,55 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: make FOE L2 u16 field order endian-aware (BE + LE)
+
+__en75_ppe_foe_commit() byte-swaps the FOE entry one 32-bit word at a time
+(cpu_to_le32). On big-endian that also swaps the two u16 halves of any word
+packing two u16s, so struct en75_foe_mac_info must declare those pairs reversed
+to land correctly in the little-endian table. On little-endian cpu_to_le32 is a
+no-op and the natural (mainline) order is correct -- the previous unconditional
+BE order corrupted the rewritten L2 header on the EN7528 (EX20v): bound flows
+carried a scrambled next-hop MAC and offloaded traffic was dropped. Gate on
+CONFIG_CPU_BIG_ENDIAN.
+
+--- a/econet_foe.h
++++ b/econet_foe.h
+@@ -73,19 +73,40 @@
+ #define EN75_FOE_IB2_DSCP		GENMASK(31, 24)
+ 
+ /* Shared L2 trailer: rewritten MAC/VLAN/PPPoE header for the bound flow. */
++/*
++ * __en75_ppe_foe_commit() byte-swaps each 32-bit word (cpu_to_le32). On a
++ * big-endian host that swaps the two u16 halves of every two-u16 word, so
++ * those pairs are declared reversed to land right in the LE table; on a
++ * little-endian host cpu_to_le32 is a no-op and the natural order is correct.
++ */
+ struct en75_foe_mac_info {
++#ifdef CONFIG_CPU_BIG_ENDIAN
++	u16 etype;
++	u16 vlan1;
++#else
+ 	u16 vlan1;
+ 	u16 etype;
++#endif
+ 
+ 	u32 dest_mac_hi;
+ 
++#ifdef CONFIG_CPU_BIG_ENDIAN
++	u16 dest_mac_lo;
++	u16 vlan2;
++#else
+ 	u16 vlan2;
+ 	u16 dest_mac_lo;
++#endif
+ 
+ 	u32 src_mac_hi;
+ 
++#ifdef CONFIG_CPU_BIG_ENDIAN
++	u16 src_mac_lo;
++	u16 pppoe_id;
++#else
+ 	u16 pppoe_id;
+ 	u16 src_mac_lo;
++#endif
+ };
+ 
+ _Static_assert(sizeof(struct en75_foe_mac_info) == 20,

@@ -1,0 +1,97 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: register the external MT7530 MDIO bus for DSA
+
+The EN751221's external MT7530 (carrying the physical LAN/WAN ports) is
+reached over the SoC switch MDIO master (PHY_IAC at switch_regs+0x701c).
+The driver already programs it manually as a VLAN-aware switch, but it
+also has the DSA plumbing (netdev_uses_dsa, dsa_meta, ndev->dev.of_node
+set to the MAC node) needed to let the mainline mt7530 DSA driver run.
+
+Expose the MDIO master as a Linux mii_bus and register it against the
+"mdio-bus" DT node so the mainline mt7530-mdio driver binds switch@1f and
+takes over the physical ports (giving real lan1..4 / wan netdevs). The
+clause-22 accessors are the raw en75_mdio_read()/write(); mt7530-mdio
+layers its own page protocol on top. When the DSA driver binds it resets
+the switch and supersedes the manual setup; if there is no mdio-bus node
+or DSA fails to bind, the manual VLAN setup stays in effect as a fallback.
+
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -38,6 +38,8 @@
+ #include <linux/reset.h>
+ #include <linux/delay.h>
+ #include <linux/of_net.h>
++#include <linux/of_mdio.h>
++#include <linux/phy.h>
+ 
+ #include "gdm_regs.h"
+ #include "linux/dev_printk.h"
+@@ -589,6 +591,58 @@
+ 	en75_ext_sw_dump(sw, dev);
+ }
+ 
++/*
++ * Expose the SoC switch MDIO master (PHY_IAC) as a Linux mii_bus so the
++ * mainline mt7530 DSA driver can bind the external MT7530 (switch@1f) and
++ * manage the physical LAN/WAN ports. The clause-22 accessors below are the
++ * raw register reads/writes; the mt7530-mdio driver layers its own page
++ * protocol on top, exactly like en75_ext_sw_read()/write() do here.
++ *
++ * If the DSA driver binds it resets the switch and takes over, superseding
++ * the manual VLAN setup in en75_ext_sw_setup(). If there is no mdio-bus node
++ * (or DSA fails to bind) the manual setup stays in effect as a fallback.
++ */
++static int en75_mii_read(struct mii_bus *bus, int addr, int reg)
++{
++	return en75_mdio_read((u32 __iomem *)bus->priv, addr, reg);
++}
++
++static int en75_mii_write(struct mii_bus *bus, int addr, int reg, u16 val)
++{
++	en75_mdio_write((u32 __iomem *)bus->priv, addr, reg, val);
++	return 0;
++}
++
++static void en75_mdio_register(struct en75_eth_pvt *eth, struct device *dev)
++{
++	struct device_node *mnp;
++	struct mii_bus *bus;
++	int err;
++
++	mnp = of_get_child_by_name(dev->of_node, "mdio-bus");
++	if (!mnp)
++		return;
++
++	bus = devm_mdiobus_alloc(dev);
++	if (!bus) {
++		of_node_put(mnp);
++		return;
++	}
++
++	bus->name = "en75-mdio";
++	bus->read = en75_mii_read;
++	bus->write = en75_mii_write;
++	bus->parent = dev;
++	bus->priv = (void *)eth->regs->switch_regs;
++	snprintf(bus->id, MII_BUS_ID_SIZE, "%s", dev_name(dev));
++
++	err = devm_of_mdiobus_register(dev, bus, mnp);
++	of_node_put(mnp);
++	if (err)
++		dev_warn(dev, "MDIO bus register failed (%d); keeping manual switch setup\n",
++			 err);
++}
++
+ static int en75_probe(struct platform_device *pdev)
+ {
+ 	struct en75_debug_conf debug_conf = {0};
+@@ -692,6 +746,9 @@
+ 	/* Configure the external MT7530 (physical ports) for VLAN WAN/LAN split. */
+ 	en75_ext_sw_setup(regs->switch_regs, &pdev->dev);
+ 
++	/* Hand the external switch to the mainline mt7530 DSA driver. */
++	en75_mdio_register(eth, &pdev->dev);
++
+ 	return 0;
+ 
+ error:

@@ -1,0 +1,26 @@
+#!/bin/sh
+# TP-Link EX20v: system defaults — timezone (Turkey / UTC+3) + hostname.
+#
+# Timezone: OpenWrt ships 'UTC'. Turkey has a permanent UTC+3 offset with no DST
+# since 2016, so the POSIX TZ string is simply "<+03>-3" (sign inverted in POSIX:
+# east-of-UTC becomes negative). zonename is the human-readable Olson name.
+#
+# Hostname: default 'OpenWrt' -> 'EX20v' so the device identifies itself by model
+# in LuCI, SSH prompt and on the network.
+#
+# Runs once at first boot / factory reset; committed values persist across
+# reboots and can still be changed by the user from LuCI afterwards.
+
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "tplink,ex20v" ] || exit 0
+
+uci -q batch <<-EOF
+	set system.@system[0].zonename='Europe/Istanbul'
+	set system.@system[0].timezone='<+03>-3'
+	set system.@system[0].hostname='EX20v'
+	commit system
+EOF
+
+# apply the new hostname immediately (also picked up on next boot from config)
+echo 'EX20v' > /proc/sys/kernel/hostname 2>/dev/null
+
+exit 0

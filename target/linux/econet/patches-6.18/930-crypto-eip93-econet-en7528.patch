@@ -1,0 +1,89 @@
+From: SurNet <surnet@localhost>
+Date: Mon, 18 Aug 2026 18:00:00 +0300
+Subject: [PATCH] crypto: eip93: enable on EcoNet EN7528/EN751221
+
+The EcoNet EN7528 (and EN751221) SoCs integrate an Inside Secure
+SafeXcel EIP-93 crypto engine at a fixed MMIO window (0x1fb70000 on
+EN7528, GIC shared interrupt source 28), identified from the stock
+EN7561D crypto_k.ko and vendor GIC source table
+(PCI id 0x16ae:0x0093, HWPAL device "SafeXcel_EIP_93").
+
+Two changes are needed versus the MT7621 integration:
+ - allow the driver to build on ECONET;
+ - unlike MT7621 (where the block is permanently clocked and out of
+   reset), here the crypto clock is a fixed-rate always-on clock but the
+   block is left held in reset by the bootloader, so probe must deassert
+   the reset (and enable the optional clock) before touching any
+   register. Both are optional so existing MT7621 platforms are
+   unaffected. An early identification read is logged to confirm the
+   engine responds at the configured base.
+
+Signed-off-by: SurNet <surnet@localhost>
+---
+--- a/drivers/crypto/inside-secure/eip93/Kconfig
++++ b/drivers/crypto/inside-secure/eip93/Kconfig
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ config CRYPTO_DEV_EIP93
+ 	tristate "Support for EIP93 crypto HW accelerators"
+-	depends on SOC_MT7621 || ARCH_AIROHA ||COMPILE_TEST
++	depends on SOC_MT7621 || ARCH_AIROHA || ECONET || COMPILE_TEST
+ 	select CRYPTO_LIB_AES
+ 	select CRYPTO_LIB_DES
+ 	select CRYPTO_SKCIPHER
+--- a/drivers/crypto/inside-secure/eip93/eip93-main.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-main.c
+@@ -14,6 +14,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/reset.h>
+ #include <linux/spinlock.h>
+ #include <crypto/aes.h>
+ #include <crypto/ctr.h>
+@@ -412,6 +413,8 @@
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct eip93_device *eip93;
++	struct reset_control *rstc;
++	struct clk *clk;
+ 	u32 ver, algo_flags;
+ 	int ret;
+ 
+@@ -426,6 +429,36 @@
+ 	if (IS_ERR(eip93->base))
+ 		return PTR_ERR(eip93->base);
+ 
++	/*
++	 * EcoNet EN7528/EN751221: bring the crypto block out of gate/reset
++	 * before touching any register. Unlike the MT7621 integration (where
++	 * the block is always clocked), here the crypto clock/reset are
++	 * software-controlled and the bootloader leaves the engine held in
++	 * reset -- reading registers first would otherwise return reset-state
++	 * garbage (or on a gated bus, hang). Both are optional so other SoCs
++	 * that lack them keep working unchanged.
++	 */
++	clk = devm_clk_get_optional_enabled(dev, NULL);
++	if (IS_ERR(clk))
++		return dev_err_probe(dev, PTR_ERR(clk),
++				     "failed to enable crypto clock\n");
++
++	rstc = devm_reset_control_get_optional_exclusive(dev, NULL);
++	if (IS_ERR(rstc))
++		return dev_err_probe(dev, PTR_ERR(rstc),
++				     "failed to get crypto reset\n");
++	reset_control_deassert(rstc);
++	usleep_range(10, 20);
++
++	/*
++	 * Early identification read. Confirms the engine actually responds at
++	 * this base address before the rest of probe programs the rings.
++	 */
++	ver = readl(eip93->base + EIP93_REG_PE_REVISION);
++	dev_info(dev, "EIP93 id: REV=0x%08x OPT0=0x%08x OPT1=0x%08x\n",
++		 ver, readl(eip93->base + EIP93_REG_PE_OPTION_0),
++		 readl(eip93->base + EIP93_REG_PE_OPTION_1));
++
+ 	eip93->irq = platform_get_irq(pdev, 0);
+ 	if (eip93->irq < 0)
+ 		return eip93->irq;

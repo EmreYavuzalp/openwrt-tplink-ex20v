@@ -1,0 +1,19 @@
+#!/bin/sh
+# econet (C5v / EX20v / VMG): ilk boot'ta /etc/board.json'un dolu olmasini garantile.
+#
+# Taze (-n) flash sonrası ilk boot bazen /etc/board.json'u BOŞ (0 byte) bırakıyor.
+# Yeni ucode wifi generator'ı find_phy_by_path() içinde
+# json(readfile("/etc/board.json")) yapıyor; boş dosya "unexpected end of data"
+# hatası fırlatıyor -> "PHY is undefined for device" -> her iki radyo da
+# retry_setup_failed ile kuruluyor ve Wi-Fi hiç açılmıyor.
+#
+# board_detect yalnızca dosya boş/eksikken yazar (temp+mv), yani geçerli bir
+# board.json asla ezilmez. Bu script wifi ayarından (94-ex20v-wifi-default) ve
+# radyo bring-up'ından ÖNCE (düşük numara) çalışır.
+if [ ! -s /etc/board.json ]; then
+	/bin/board_detect
+	# netifd bu script'ten önce radyoları (başarısız) kurmaya çalıştıysa,
+	# phy artık çözülebildiği için wireless'ı yeniden uygula.
+	/sbin/wifi reload 2>/dev/null
+fi
+exit 0

@@ -1,0 +1,165 @@
+From: Emre Yavuzalp <emreyavuzalp@gmail.com>
+Subject: econet-eth: set up the external MT7530 for VLAN WAN/LAN split
+
+The physical LAN/WAN ports of EN751221 boards (e.g. TP-Link Archer C5v)
+are on an external MT7530 reached over MDIO (switch address 0x1f), not on
+the SoC's internal MMIO switch. The boot ROM only configures that switch
+on the TFTP/recovery path, so after booting from NAND it forwards nothing.
+
+Reach it through the SoC switch MDIO master (PHY_IAC at switch_regs+0x701c)
+and program it as a VLAN-aware switch: LAN ports 0-3 in VID 1, WAN port 4
+in VID 2, CPU port 6 a tagged member of both. The CPU GMAC passes the
+802.1Q tag through, so Linux splits the ports via eth0.1 (LAN) / eth0.2
+(WAN). The TRGMII CPU port link is force-enabled like the boot ROM does,
+otherwise the driver's GSW reset leaves it down on some boots.
+
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -36,6 +36,7 @@
+ #include <net/dsa.h>
+ #include <linux/platform_device.h>
+ #include <linux/reset.h>
++#include <linux/delay.h>
+ #include <linux/of_net.h>
+ 
+ #include "gdm_regs.h"
+@@ -296,6 +297,129 @@
+ 	platform_set_drvdata(pdev, NULL);
+ }
+ 
++/*
++ * The SoC switch MDIO master (PHY_IAC at switch_regs + 0x701c) reaches the
++ * external MT7530 (MDIO address 0x1f) which carries the physical LAN/WAN
++ * ports. The bootloader only configures that switch on the TFTP boot path,
++ * so after a NAND boot it forwards nothing. Set it up here as a VLAN-aware
++ * switch: LAN ports (0-3) in VID 1, WAN port (4) in VID 2, CPU port (6)
++ * tagged member of both so Linux can split them via eth0.1 / eth0.2.
++ */
++#define MT7530_PHY_IAC		0x701c
++#define  PHY_IAC_ACCESS		BIT(31)
++#define  PHY_IAC_READ		BIT(19)
++#define  PHY_IAC_WRITE		BIT(18)
++#define  PHY_IAC_START		BIT(16)
++#define  PHY_IAC_REG_SHIFT	25
++#define  PHY_IAC_ADDR_SHIFT	20
++#define EXT_MT7530_MDIO_ADDR	0x1f
++
++static void en75_mdio_wait(u32 __iomem *iac)
++{
++	int i;
++
++	for (i = 0; i < 1000; i++) {
++		if (!(readl(iac) & PHY_IAC_ACCESS))
++			return;
++		udelay(10);
++	}
++}
++
++static void en75_mdio_write(u32 __iomem *sw, u32 phy, u32 reg, u32 val)
++{
++	u32 __iomem *iac = &sw[MT7530_PHY_IAC / 4];
++
++	en75_mdio_wait(iac);
++	writel(PHY_IAC_ACCESS | PHY_IAC_START | PHY_IAC_WRITE |
++	       (reg << PHY_IAC_REG_SHIFT) | (phy << PHY_IAC_ADDR_SHIFT) |
++	       (val & 0xffff), iac);
++	en75_mdio_wait(iac);
++}
++
++static u16 en75_mdio_read(u32 __iomem *sw, u32 phy, u32 reg)
++{
++	u32 __iomem *iac = &sw[MT7530_PHY_IAC / 4];
++
++	en75_mdio_wait(iac);
++	writel(PHY_IAC_ACCESS | PHY_IAC_START | PHY_IAC_READ |
++	       (reg << PHY_IAC_REG_SHIFT) | (phy << PHY_IAC_ADDR_SHIFT), iac);
++	en75_mdio_wait(iac);
++	return readl(iac) & 0xffff;
++}
++
++/* 32-bit register access of the external MT7530 via its MDIO page protocol. */
++static void en75_ext_sw_write(u32 __iomem *sw, u32 reg, u32 val)
++{
++	en75_mdio_write(sw, EXT_MT7530_MDIO_ADDR, 0x1f, (reg >> 6) & 0x3ff);
++	en75_mdio_write(sw, EXT_MT7530_MDIO_ADDR, (reg >> 2) & 0xf, val & 0xffff);
++	en75_mdio_write(sw, EXT_MT7530_MDIO_ADDR, 0x10, val >> 16);
++}
++
++static u32 en75_ext_sw_read(u32 __iomem *sw, u32 reg)
++{
++	u32 lo, hi;
++
++	en75_mdio_write(sw, EXT_MT7530_MDIO_ADDR, 0x1f, (reg >> 6) & 0x3ff);
++	lo = en75_mdio_read(sw, EXT_MT7530_MDIO_ADDR, (reg >> 2) & 0xf);
++	hi = en75_mdio_read(sw, EXT_MT7530_MDIO_ADDR, 0x10);
++	return (hi << 16) | lo;
++}
++
++/* Program one VLAN table entry (members bitmap, per-port egress tag word). */
++static void en75_ext_sw_vlan(u32 __iomem *sw, u16 vid, u32 members, u32 etag)
++{
++	int i;
++
++	/* VAWD1: IVL_MAC | VTAG_EN | PORT_MEM(members) | FID(1) | VLAN_VALID */
++	en75_ext_sw_write(sw, 0x94, 0x50000000 | (members << 16) | 0x3);
++	en75_ext_sw_write(sw, 0x98, etag);
++	/* VTCR: BUSY | FUNC(WR_VID) | vid */
++	en75_ext_sw_write(sw, 0x90, 0x80001000 | vid);
++	for (i = 0; i < 1000; i++) {
++		if (!(en75_ext_sw_read(sw, 0x90) & BIT(31)))
++			break;
++		udelay(10);
++	}
++}
++
++static void en75_ext_sw_setup(u32 __iomem *sw)
++{
++	int p;
++
++	/* Enable CPU port 6 and broadcast/unknown flooding. */
++	en75_ext_sw_write(sw, MT753X_MFC, EN75_MFC_CONFIG);
++
++	/* Force the TRGMII CPU port (6) link up, exactly as the boot ROM does.
++	 * The driver's GSW reset can clear this, which leaves the external
++	 * switch's CPU link down on some boots -> intermittent "no ethernet".
++	 * 0x9e30b = force link, 1Gbps, full duplex, MAC TX/RX enabled. */
++	en75_ext_sw_write(sw, 0x3600, EN75_PMCR_CONFIG);
++
++	/* VID 1 = LAN ports 0-3 + CPU(6, tagged); VID 2 = WAN port 4 + CPU. */
++	en75_ext_sw_vlan(sw, 1, 0x4f, 0x2000);
++	en75_ext_sw_vlan(sw, 2, 0x50, 0x2000);
++	/* VID 35 = WAN(4) + CPU(6), both tagged -> ISP PPPoE trunk on eth0.35.
++	 * Additive: WAN port4 stays in VID2 (untagged, PVID2) for plain DHCP and
++	 * also joins VID35 (tagged) so VID35-tagged ISP frames pass to the CPU. */
++	en75_ext_sw_vlan(sw, 35, 0x50, 0x2200);
++
++	/* LAN ports: security mode, PVID 1, VLAN-aware user port. */
++	for (p = 0; p <= 3; p++) {
++		en75_ext_sw_write(sw, 0x2004 + p * 0x100, 0x00ff0003);
++		en75_ext_sw_write(sw, 0x2014 + p * 0x100, 1);
++		en75_ext_sw_write(sw, 0x2010 + p * 0x100, 0x81000000);
++	}
++
++	/* WAN port 4: security mode, PVID 2. */
++	en75_ext_sw_write(sw, 0x2404, 0x00ff0003);
++	en75_ext_sw_write(sw, 0x2414, 2);
++	en75_ext_sw_write(sw, 0x2410, 0x81000000);
++
++	/* CPU port 6: forward to all, SECURITY mode (not matrix) so CPU-injected tagged frames keep their VID -> tagged egress (PPPoE VID35). */
++	en75_ext_sw_write(sw, 0x2604, 0x00ff0003);
++	en75_ext_sw_write(sw, 0x2610, 0x81000000);
++}
++
+ static int en75_probe(struct platform_device *pdev)
+ {
+ 	struct en75_debug_conf debug_conf = {0};
+@@ -393,6 +513,9 @@
+ 	en75_wreg(EN75_PMCR_CONFIG, &regs->switch_regs[MT753X_PMCR_P(6) / 4]);
+ 	en75_wreg(EN75_MFC_CONFIG, &regs->switch_regs[MT753X_MFC / 4]);
+ 
++	/* Configure the external MT7530 (physical ports) for VLAN WAN/LAN split. */
++	en75_ext_sw_setup(regs->switch_regs);
++
+ 	return 0;
+ 
+ error:
